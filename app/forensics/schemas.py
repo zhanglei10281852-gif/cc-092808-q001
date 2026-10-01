@@ -160,6 +160,12 @@ class MovePlacement(BaseModel):
     reason: str = Field(min_length=2, max_length=300)
 
 
+class WithdrawalAllocation(BaseModel):
+    placement_id: int = Field(gt=0)
+    quantity: float = Field(gt=0)
+    expected_version: int | None = Field(default=None, gt=0)
+
+
 class WithdrawalCreate(BaseModel):
     specimen_id: int = Field(gt=0)
     quantity: float = Field(gt=0)
@@ -167,6 +173,17 @@ class WithdrawalCreate(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=100)
     actor: str = Field(min_length=1, max_length=100)
     reason: str = Field(min_length=2, max_length=300)
+    allocations: list[WithdrawalAllocation] | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_allocations_total(self) -> "WithdrawalCreate":
+        if self.allocations is not None:
+            if not self.allocations:
+                raise ValueError("容器分配清单不能为空")
+            total = round(sum(item.quantity for item in self.allocations), 6)
+            if abs(total - round(self.quantity, 6)) > 1e-9:
+                raise ValueError("各容器分配数量之和必须等于耗用总量")
+        return self
 
 
 class HoldCreate(BaseModel):
@@ -295,6 +312,10 @@ class ReleaseDecision(BaseModel):
     expected_version: int = Field(gt=0)
     actor: str = Field(min_length=1, max_length=100)
     reason: str = Field(default="", max_length=500)
+
+
+class ReleaseFulfill(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
 
 
 class Page(BaseModel):

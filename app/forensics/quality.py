@@ -8,6 +8,7 @@ from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.forensics.custody import CustodyService
 from app.forensics.repository import ForensicRepository, record, records
 
 
@@ -152,6 +153,7 @@ class ReleaseService:
         self.connection = connection
         self.clock = clock or SystemClock()
         self.repository = ForensicRepository(connection)
+        self.custody = CustodyService(connection, self.clock)
 
     def create_request(self, data: dict[str, Any]) -> dict[str, Any]:
         timestamp = to_storage(self.clock.now())
@@ -240,3 +242,41 @@ class ReleaseService:
             (case_id, quantity),
         ).fetchone()
         return record(row)
+
+    def fulfill(self, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """发放入库：在同一事务内对每条已分配明细执行容器级领用扣减，任一失败整单回滚。"""
+        request = self.repository.require_release(request_id)
+        if request["status"] == "fulfilled":
+            return {"request": self.repository.release_detail(request_id), "movements": [], "replayed": True}
+        if request["status"] != "approved":
+            raise ConflictError("只有已批准的领用申请可以发放")
+        detail = self.repository.release_detail(request_id)
+        reason = f"领用单 {request['request_no']}：{request['purpose']}"[:300]
+        movements: list[dict[str, Any]] = []
+        for item in detail["items"]:
+            specimen_id = item["allocated_specimen_id"]
+            if item["status"] != "allocated" or not specimen_id:
+                raise ConflictError("存在尚未分配检材的领用明细，不能发放", context={"item_id": item["id"]})
+            result = self.custody.withdraw({
+                "specimen_id": int(specimen_id),
+                "quantity": float(item["quantity"]),
+                "movement_type": "领用",
+                # 业务键由申请与明细身份构成，重试不会重复扣减
+                "idempotency_key": f"release-{request_id}-item-{item['id']}",
+                "actor": data["actor"],
+                "reason": reason,
+            })
+            movements.append(result["movement"])
+            self.connection.execute(
+                "UPDATE release_items SET status='fulfilled' WHERE id=?", (item["id"],)
+            )
+        updated = self.connection.execute(
+            "UPDATE release_requests SET status='fulfilled' WHERE id=? AND status='approved'", (request_id,)
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("领用申请状态已变化，发放已回滚")
+        return {
+            "request": self.repository.release_detail(request_id),
+            "movements": movements,
+            "replayed": False,
+        }

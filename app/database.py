@@ -211,7 +211,7 @@ CREATE TABLE IF NOT EXISTS specimen_placements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE CASCADE,
     location_id INTEGER NOT NULL REFERENCES storage_locations(id) ON DELETE RESTRICT,
-    quantity REAL NOT NULL CHECK(quantity > 0),
+    quantity REAL NOT NULL CHECK(quantity >= 0),
     container_code TEXT NOT NULL,
     placed_at TEXT NOT NULL,
     removed_at TEXT,
@@ -245,6 +245,20 @@ CREATE TABLE IF NOT EXISTS specimen_holds (
     release_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_holds_active ON specimen_holds(specimen_id,released_at);
+CREATE TABLE IF NOT EXISTS custody_consumptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES custody_events(id) ON DELETE CASCADE,
+    specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE CASCADE,
+    placement_id INTEGER NOT NULL REFERENCES specimen_placements(id) ON DELETE RESTRICT,
+    container_code TEXT NOT NULL,
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    placement_version INTEGER NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consumptions_event ON custody_consumptions(event_id);
+CREATE INDEX IF NOT EXISTS idx_consumptions_placement ON custody_consumptions(placement_id);
+CREATE INDEX IF NOT EXISTS idx_consumptions_specimen ON custody_consumptions(specimen_id,id);
 
 CREATE TABLE IF NOT EXISTS examination_protocols (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

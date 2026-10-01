@@ -115,6 +115,23 @@ class ForensicRepository:
             "SELECT * FROM specimen_holds WHERE specimen_id=? AND released_at IS NULL ORDER BY id", (specimen_id,)
         ).fetchall())
 
+    def active_placements(self, specimen_id: int) -> list[dict[str, Any]]:
+        """在库容器，按入库时间从早到晚排序，作为耗用自动分配的稳定次序（先进先出）。"""
+        return records(self.connection.execute(
+            "SELECT * FROM specimen_placements WHERE specimen_id=? AND removed_at IS NULL "
+            "ORDER BY placed_at,id",
+            (specimen_id,),
+        ).fetchall())
+
+    def consumptions_for_event(self, event_id: int) -> list[dict[str, Any]]:
+        return records(self.connection.execute(
+            "SELECT c.*,p.location_id,l.location_code FROM custody_consumptions c "
+            "JOIN specimen_placements p ON p.id=c.placement_id "
+            "JOIN storage_locations l ON l.id=p.location_id "
+            "WHERE c.event_id=? ORDER BY c.id",
+            (event_id,),
+        ).fetchall())
+
     def specimen_detail(self, specimen_id: int) -> dict[str, Any]:
         item = self.require_specimen(specimen_id)
         item["forensic_case"] = self.require_forensic_case(int(item["case_id"]))
@@ -124,6 +141,11 @@ class ForensicRepository:
         ).fetchall())
         item["movements"] = records(self.connection.execute(
             "SELECT * FROM custody_events WHERE specimen_id=? ORDER BY id", (specimen_id,)
+        ).fetchall())
+        item["consumptions"] = records(self.connection.execute(
+            "SELECT c.*,e.movement_type,e.idempotency_key FROM custody_consumptions c "
+            "JOIN custody_events e ON e.id=c.event_id WHERE c.specimen_id=? ORDER BY c.id",
+            (specimen_id,),
         ).fetchall())
         item["holds"] = records(self.connection.execute(
             "SELECT * FROM specimen_holds WHERE specimen_id=? ORDER BY id", (specimen_id,)

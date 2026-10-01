@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
-from app.core.clock import Clock, SystemClock, to_storage
+from app.core.clock import Clock, SystemClock, from_storage, to_storage
 from app.core.errors import ConflictError, ValidationError
 from app.forensics.repository import ForensicRepository, record
+
+# 浮点数量统一保留 6 位小数，比较与条件更新都以此容差兜底
+QUANTITY_EPSILON = 1e-9
 
 
 class CustodyService:
@@ -132,6 +137,13 @@ class CustodyService:
         if used + float(placement["quantity"]) > float(target["capacity_units"]) + 1e-9:
             raise ConflictError("目标库位容量不足", context={"available_grams": target["capacity_units"] - used})
         timestamp = to_storage(self.clock.now())
+        # 时间戳精确到秒；同一秒内连续移库时，新摆放时间必须晚于该容器上次摆放时间以免唯一约束冲突
+        latest_placed = self.connection.execute(
+            "SELECT MAX(placed_at) FROM specimen_placements WHERE container_code=?",
+            (placement["container_code"],),
+        ).fetchone()[0]
+        if latest_placed and timestamp <= latest_placed:
+            timestamp = to_storage(from_storage(latest_placed) + timedelta(seconds=1))
         cursor = self.connection.execute(
             "INSERT INTO specimen_placements(specimen_id,location_id,quantity,container_code,placed_at) VALUES(?,?,?,?,?)",
             (placement["specimen_id"], target["id"], placement["quantity"], placement["container_code"], timestamp),
@@ -154,32 +166,229 @@ class CustodyService:
         return {"placement": self.repository.require_placement(new_id), "replayed": False}
 
     def withdraw(self, data: dict[str, Any]) -> dict[str, Any]:
-        previous = self.repository.custody_event_by_key(data["idempotency_key"])
+        key = data["idempotency_key"]
+        quantity = round(float(data["quantity"]), 6)
+        if quantity <= 0:
+            raise ValidationError("耗用数量必须为正数")
+        previous = self.repository.custody_event_by_key(key)
+        # 命中相同业务键时优先做冲突比对：数量/类型/用途不同即冲突，不进入后续结构校验
         if previous:
-            return {"specimen": self.repository.specimen_detail(int(previous["specimen_id"])), "movement": previous, "replayed": True}
+            requested = self._normalize_allocations(data.get("allocations"), quantity, strict=False)
+            return self._replay_withdrawal(previous, data, quantity, requested)
+        requested = self._normalize_allocations(data.get("allocations"), quantity)
         specimen = self.repository.require_specimen(int(data["specimen_id"]))
+        if specimen["status"] == "disposed":
+            raise ConflictError("检材已经销毁，不能再耗用")
         holds = self.repository.active_holds(int(specimen["id"]))
         if holds:
             raise ConflictError("检材存在未解除的保全、质量或权限冻结", context={"holds": [item["id"] for item in holds]})
-        quantity = float(data["quantity"])
-        if quantity > float(specimen["available_quantity"]) + 1e-9:
+        if quantity > float(specimen["available_quantity"]) + QUANTITY_EPSILON:
             raise ConflictError("检材可用数量不足")
+        allocations = self._resolve_allocations(specimen, requested, quantity)
+        allocation_mode = "auto" if requested is None else "explicit"
         timestamp = to_storage(self.clock.now())
-        remaining = round(float(specimen["available_quantity"]) - quantity, 6)
-        status = "depleted" if remaining <= 1e-9 else specimen["status"]
-        self.connection.execute(
-            "UPDATE specimens SET available_quantity=?,status=?,version=version+1,updated_at=? WHERE id=?",
-            (remaining, status, timestamp, specimen["id"]),
+        # 检材总量条件扣减：available_quantity>=? 兜底，任何并发耗用都不会产生负数
+        updated = self.connection.execute(
+            "UPDATE specimens SET available_quantity=ROUND(available_quantity-?,6),"
+            "status=CASE WHEN ROUND(available_quantity-?,6)<=0 "
+            "THEN CASE ? WHEN '报废' THEN 'disposed' ELSE 'depleted' END ELSE status END,"
+            "version=version+1,updated_at=? WHERE id=? AND available_quantity>=?",
+            (quantity, quantity, data["movement_type"], timestamp, specimen["id"], quantity - QUANTITY_EPSILON),
         )
-        cursor = self.connection.execute(
-            "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (specimen["id"], data["movement_type"], -quantity, data["idempotency_key"], data["actor"], data["reason"], timestamp),
-        )
+        if updated.rowcount != 1:
+            raise ConflictError("检材可用数量不足或检材已被并发耗用")
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (specimen["id"], data["movement_type"], -quantity, key, data["actor"], data["reason"], timestamp),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("相同业务键的耗用请求正在处理或已存在") from exc
+        event_id = int(cursor.lastrowid)
+        # 逐容器条件扣减；不足、已移出或版本过期都会令 rowcount=0 并回滚整次耗用
+        for placement_id, container_code, amount, expected_version in allocations:
+            result = self.connection.execute(
+                "UPDATE specimen_placements SET quantity=ROUND(quantity-?,6),version=version+1 "
+                "WHERE id=? AND specimen_id=? AND removed_at IS NULL AND quantity>=?"
+                + (" AND version=?" if expected_version is not None else ""),
+                (amount, placement_id, specimen["id"], amount - QUANTITY_EPSILON)
+                + ((expected_version,) if expected_version is not None else ()),
+            )
+            if result.rowcount != 1:
+                current = record(self.connection.execute(
+                    "SELECT * FROM specimen_placements WHERE id=?", (placement_id,)
+                ).fetchone())
+                if current is None or int(current["specimen_id"]) != int(specimen["id"]):
+                    raise ConflictError("扣减容器不存在或不属于该检材", context={"placement_id": placement_id})
+                if current["removed_at"]:
+                    raise ConflictError("容器已经移出原库位，不能再扣减", context={"placement_id": placement_id})
+                if expected_version is not None and int(current["version"]) != expected_version:
+                    raise ConflictError("容器摆放版本过期", context={
+                        "placement_id": placement_id, "current_version": current["version"],
+                    })
+                raise ConflictError("容器内数量不足，整次耗用已回滚", context={
+                    "placement_id": placement_id, "container_code": current["container_code"],
+                    "available": current["quantity"], "requested": amount,
+                })
+            self.connection.execute(
+                "INSERT INTO custody_consumptions(event_id,specimen_id,placement_id,container_code,quantity,"
+                "placement_version,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    event_id, specimen["id"], placement_id, container_code, amount,
+                    expected_version if expected_version is not None else 0,
+                    json.dumps({
+                        "mode": allocation_mode,
+                        "allocation": {"placement_id": placement_id, "quantity": amount},
+                    }, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+            # 容器被取空即视为该封装物理移出当前库位，不再占用容量；记录保留以供耗用追溯
+            self.connection.execute(
+                "UPDATE specimen_placements SET removed_at=? WHERE id=? AND removed_at IS NULL AND quantity<=?",
+                (timestamp, placement_id, QUANTITY_EPSILON),
+            )
+        movement = record(self.connection.execute(
+            "SELECT * FROM custody_events WHERE id=?", (event_id,)
+        ).fetchone())
         return {
             "specimen": self.repository.specimen_detail(int(specimen["id"])),
-            "movement": record(self.connection.execute("SELECT * FROM custody_events WHERE id=?", (cursor.lastrowid,)).fetchone()),
+            "movement": movement,
+            "consumptions": self.repository.consumptions_for_event(event_id),
             "replayed": False,
+        }
+
+    def _normalize_allocations(
+        self, raw: list[dict[str, Any]] | None, total: float, *, strict: bool = True
+    ) -> list[dict[str, int | float | None]] | None:
+        """校验显式分配：正数、容器不重复、合计必须等于请求总量。
+
+        幂等重试路径传 strict=False：此时数量本身可能就是冲突点，
+        合计校验会被 _replay_withdrawal 的数量比对取代。
+        """
+        if raw is None:
+            return None
+        if not raw:
+            raise ValidationError("容器分配清单不能为空")
+        normalized: list[dict[str, int | float | None]] = []
+        seen: set[int] = set()
+        subtotal = 0.0
+        for item in raw:
+            placement_id = int(item.get("placement_id", 0))
+            amount = round(float(item.get("quantity", 0)), 6)
+            if placement_id <= 0 or amount <= 0:
+                raise ValidationError("容器分配必须包含有效的摆放记录和正数数量")
+            if placement_id in seen:
+                raise ValidationError("同一容器不能在分配清单中重复出现", context={"placement_id": placement_id})
+            seen.add(placement_id)
+            version = item.get("expected_version")
+            normalized.append({
+                "placement_id": placement_id,
+                "quantity": amount,
+                "expected_version": int(version) if version is not None else None,
+            })
+            subtotal = round(subtotal + amount, 6)
+        if strict and abs(subtotal - total) > QUANTITY_EPSILON:
+            raise ValidationError("各容器分配数量之和必须等于耗用总量", context={
+                "allocated": subtotal, "requested": total,
+            })
+        return normalized
+
+    def _resolve_allocations(
+        self,
+        specimen: dict[str, Any],
+        requested: list[dict[str, int | float | None]] | None,
+        total: float,
+    ) -> list[tuple[int, str, float, int | None]]:
+        """返回 (placement_id, container_code, amount, expected_version) 的稳定扣减序列。"""
+        active = self.repository.active_placements(int(specimen["id"]))
+        if requested is None:
+            return self._auto_allocate(active, total)
+        by_id = {int(item["id"]): item for item in active}
+        resolved: list[tuple[int, str, float, int | None]] = []
+        for item in requested:
+            placement_id = int(item["placement_id"])
+            placement = by_id.get(placement_id)
+            if placement is None:
+                stored = record(self.connection.execute(
+                    "SELECT * FROM specimen_placements WHERE id=?", (placement_id,)
+                ).fetchone())
+                if stored is None or int(stored["specimen_id"]) != int(specimen["id"]):
+                    raise ConflictError("扣减容器不存在或不属于该检材", context={"placement_id": placement_id})
+                raise ConflictError("容器已经移出原库位，不能再扣减", context={"placement_id": placement_id})
+            amount = float(item["quantity"])
+            if amount > float(placement["quantity"]) + QUANTITY_EPSILON:
+                raise ConflictError("指定容器内数量不足，整次耗用已回滚", context={
+                    "placement_id": placement_id, "container_code": placement["container_code"],
+                    "available": placement["quantity"], "requested": amount,
+                })
+            resolved.append((placement_id, placement["container_code"], amount, item["expected_version"]))
+        return resolved
+
+    def _auto_allocate(
+        self, active: list[dict[str, Any]], total: float
+    ) -> list[tuple[int, str, float, int | None]]:
+        """未指定分配时按入库时间从早到晚依次扣减（先进先出），次序稳定可解释。"""
+        if not active:
+            raise ConflictError("检材没有在库容器，无法耗用")
+        allocations: list[tuple[int, str, float, int | None]] = []
+        remaining = total
+        for placement in active:
+            available = float(placement["quantity"])
+            if available <= QUANTITY_EPSILON:
+                continue
+            amount = round(min(available, remaining), 6)
+            allocations.append((int(placement["id"]), placement["container_code"], amount, None))
+            remaining = round(remaining - amount, 6)
+            if remaining <= QUANTITY_EPSILON:
+                return allocations
+        raise ConflictError("在库容器数量之和不足，整次耗用已回滚", context={
+            "available_in_containers": round(total - remaining, 6), "requested": total,
+        })
+
+    def _replay_withdrawal(
+        self,
+        previous: dict[str, Any],
+        data: dict[str, Any],
+        quantity: float,
+        requested: list[dict[str, int | float | None]] | None,
+    ) -> dict[str, Any]:
+        """相同业务键重试：内容一致则幂等回放，数量/用途/分配不同则报告冲突。"""
+        if previous["movement_type"] != data["movement_type"]:
+            raise ConflictError("同一业务键已用于不同耗用类型", context={
+                "existing": previous["movement_type"], "requested": data["movement_type"],
+            })
+        if abs(abs(float(previous["quantity"])) - quantity) > QUANTITY_EPSILON:
+            raise ConflictError("同一业务键对应了不同耗用数量", context={
+                "existing": abs(float(previous["quantity"])), "requested": quantity,
+            })
+        if previous["reason"] != data["reason"]:
+            raise ConflictError("同一业务键对应了不同用途说明", context={
+                "existing": previous["reason"], "requested": data["reason"],
+            })
+        existing = self.repository.consumptions_for_event(int(previous["id"]))
+        existing_map = {int(item["placement_id"]): round(float(item["quantity"]), 6) for item in existing}
+        original_explicit = any((item.get("payload") or {}).get("mode") == "explicit" for item in existing)
+        if requested is None:
+            if original_explicit:
+                raise ConflictError("同一业务键对应了不同的容器扣减分配", context={
+                    "existing": [{"placement_id": pid, "quantity": amount} for pid, amount in sorted(existing_map.items())],
+                    "requested": "auto",
+                })
+            requested_map = dict(existing_map)
+        else:
+            requested_map = {int(item["placement_id"]): round(float(item["quantity"]), 6) for item in requested}
+        if existing_map != requested_map:
+            raise ConflictError("同一业务键对应了不同的容器扣减分配", context={
+                "existing": [{"placement_id": pid, "quantity": amount} for pid, amount in sorted(existing_map.items())],
+                "requested": [{"placement_id": pid, "quantity": amount} for pid, amount in sorted(requested_map.items())],
+            })
+        return {
+            "specimen": self.repository.specimen_detail(int(previous["specimen_id"])),
+            "movement": previous,
+            "consumptions": existing,
+            "replayed": True,
         }
 
     def impose_hold(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -231,11 +440,37 @@ class CustodyService:
         placed_weight = float(self.connection.execute(
             "SELECT COALESCE(SUM(quantity),0) FROM specimen_placements WHERE specimen_id=? AND removed_at IS NULL", (specimen_id,)
         ).fetchone()[0])
+        # 容器级耗用明细之和必须与流水（负数量）及检材总账完全对齐
+        consumed_detail = float(self.connection.execute(
+            "SELECT COALESCE(SUM(quantity),0) FROM custody_consumptions WHERE specimen_id=?", (specimen_id,)
+        ).fetchone()[0])
+        consumed_ledger = round(-sum(
+            float(row[0]) for row in self.connection.execute(
+                "SELECT quantity FROM custody_events WHERE specimen_id=? AND movement_type IN ('取样','领用','报废')",
+                (specimen_id,),
+            ).fetchall()
+        ), 6)
+        min_container = self.connection.execute(
+            "SELECT COALESCE(MIN(quantity),0) FROM specimen_placements WHERE specimen_id=?", (specimen_id,)
+        ).fetchone()[0]
+        available_matches_ledger = abs(float(specimen["available_quantity"]) - expected_available) < 1e-6
+        placements_match_available = abs(placed_weight - float(specimen["available_quantity"])) < 1e-6
+        consumptions_match_ledger = abs(consumed_detail - consumed_ledger) < 1e-6
+        no_negative_container = float(min_container) >= -1e-9
         return {
             "specimen_id": specimen_id,
             "recorded_available_grams": specimen["available_quantity"],
             "expected_available_grams": expected_available,
             "active_placement_grams": placed_weight,
-            "available_matches_ledger": abs(float(specimen["available_quantity"]) - expected_available) < 1e-6,
-            "placements_within_available": placed_weight <= float(specimen["available_quantity"]) + 1e-6,
+            "consumed_grams": round(consumed_detail, 6),
+            "consumed_ledger_grams": consumed_ledger,
+            "available_matches_ledger": available_matches_ledger,
+            "placements_match_available": placements_match_available,
+            "consumptions_match_ledger": consumptions_match_ledger,
+            "placements_within_available": placements_match_available and no_negative_container,
+            "no_negative_container": no_negative_container,
+            "conserved": all((
+                available_matches_ledger, placements_match_available,
+                consumptions_match_ledger, no_negative_container,
+            )),
         }
