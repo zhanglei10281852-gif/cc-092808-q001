@@ -16,6 +16,7 @@ from app.forensics.schemas import (
     ObservationCreate,
     ReleaseCreate,
     ReleaseDecision,
+    ReleaseFulfill,
     HoldCreate,
     HoldRelease,
     LocationCreate,
@@ -346,6 +347,17 @@ def decide_release(
     principal.require("release.approve")
     with transaction(immediate=True) as connection:
         return ForensicService(connection).release.decide(request_id, data.model_dump(mode="json"))
+
+
+@router.post("/releases/{request_id}/fulfill")
+def fulfill_release(
+    request_id: int,
+    data: ReleaseFulfill,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("custody.write")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).release.fulfill(request_id, data.model_dump(mode="json"))
 
 
 @router.get("/releases/{request_id}")

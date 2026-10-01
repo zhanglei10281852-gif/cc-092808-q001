@@ -228,11 +228,22 @@ CREATE TABLE IF NOT EXISTS custody_events (
     from_location_id INTEGER REFERENCES storage_locations(id),
     to_location_id INTEGER REFERENCES storage_locations(id),
     idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL DEFAULT '',
     actor TEXT NOT NULL,
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_movements_lot ON custody_events(specimen_id,id);
+CREATE TABLE IF NOT EXISTS custody_event_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    custody_event_id INTEGER NOT NULL REFERENCES custody_events(id) ON DELETE CASCADE,
+    placement_id INTEGER NOT NULL REFERENCES specimen_placements(id),
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    container_code TEXT NOT NULL,
+    consumed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_items_event ON custody_event_items(custody_event_id);
+CREATE INDEX IF NOT EXISTS idx_event_items_placement ON custody_event_items(placement_id);
 CREATE TABLE IF NOT EXISTS specimen_holds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE CASCADE,
@@ -472,6 +483,9 @@ def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        custody_columns = {row[1] for row in connection.execute("PRAGMA table_info(custody_events)")}
+        if "request_hash" not in custody_columns:
+            connection.execute("ALTER TABLE custody_events ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

@@ -8,6 +8,7 @@ from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.forensics.custody import CustodyService
 from app.forensics.repository import ForensicRepository, record, records
 
 
@@ -153,6 +154,12 @@ class ReleaseService:
         self.clock = clock or SystemClock()
         self.repository = ForensicRepository(connection)
 
+    def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None) -> None:
+        self.connection = connection
+        self.clock = clock or SystemClock()
+        self.repository = ForensicRepository(connection)
+        self.custody = CustodyService(connection, self.clock)
+
     def create_request(self, data: dict[str, Any]) -> dict[str, Any]:
         timestamp = to_storage(self.clock.now())
         seen: set[int] = set()
@@ -229,6 +236,65 @@ class ReleaseService:
             (data["actor"], timestamp, data.get("reason", ""), request_id, data["expected_version"]),
         )
         return self.repository.release_detail(request_id)
+
+    def fulfill(self, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """按审批确定的检材执行发放：逐条调用耗用流程，任一条失败整单回滚。"""
+        request = self.repository.require_release(request_id)
+        if request["status"] == "fulfilled":
+            detail = self.repository.release_detail(request_id)
+            movements = []
+            for item in detail["items"]:
+                event = record(self.connection.execute(
+                    "SELECT * FROM custody_events WHERE idempotency_key=?",
+                    (f"release-{request_id}-item-{item['id']}",),
+                ).fetchone())
+                if event:
+                    event["items"] = self.repository.custody_event_items(int(event["id"]))
+                    movements.append(event)
+            return {"request": detail, "movements": movements, "replayed": True}
+        if int(request["version"]) != int(data["expected_version"]):
+            raise ConflictError("领用申请版本冲突", context={"current_version": request["version"]})
+        if request["status"] != "approved":
+            raise ConflictError("只有已审批通过的申请可以发放")
+        detail = self.repository.release_detail(request_id)
+        allocations = data.get("allocations") or {}
+        movements: list[dict[str, Any]] = []
+        for item in detail["items"]:
+            specimen_id = item["allocated_specimen_id"]
+            if item["status"] != "allocated" or specimen_id is None:
+                raise ConflictError("存在未完成检材分配的明细，不能发放", context={"item_id": item["id"]})
+            override = allocations.get(str(item["id"])) or allocations.get(item["id"])
+            payload_allocations = [
+                {
+                    "placement_id": int(part.get("placement_id", 0)),
+                    "quantity": float(part.get("quantity", 0)),
+                    **({"expected_version": int(part["expected_version"])} if part.get("expected_version") is not None else {}),
+                }
+                for part in (override or [])
+            ]
+            result = self.custody.withdraw({
+                "specimen_id": int(specimen_id),
+                "quantity": float(item["quantity"]),
+                "movement_type": "领用",
+                "allocations": payload_allocations or [],
+                "idempotency_key": f"release-{request_id}-item-{item['id']}",
+                "actor": data["actor"],
+                "reason": f"领用申请 {request['request_no']} 发放",
+            })
+            movements.append(result["movement"])
+            self.connection.execute(
+                "UPDATE release_items SET status='fulfilled' WHERE id=? AND status='allocated'",
+                (item["id"],),
+            )
+        timestamp = to_storage(self.clock.now())
+        self.connection.execute(
+            "UPDATE release_requests SET status='fulfilled',version=version+1 WHERE id=? AND version=? AND status='approved'",
+            (request_id, data["expected_version"]),
+        )
+        return {
+            "request": self.repository.release_detail(request_id),
+            "movements": movements,
+        }
 
     def _choose_specimen(self, case_id: int, quantity: float) -> dict[str, Any] | None:
         row = self.connection.execute(

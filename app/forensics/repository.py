@@ -89,7 +89,9 @@ class ForensicRepository:
 
     def location_usage(self, location_id: int) -> float:
         row = self.connection.execute(
-            "SELECT COALESCE(SUM(quantity),0) FROM specimen_placements WHERE location_id=? AND removed_at IS NULL",
+            "SELECT COALESCE(SUM(p.quantity - "
+            "(SELECT COALESCE(SUM(i.quantity),0) FROM custody_event_items i WHERE i.placement_id=p.id)),0) "
+            "FROM specimen_placements p WHERE p.location_id=? AND p.removed_at IS NULL",
             (location_id,),
         ).fetchone()
         return float(row[0])
@@ -99,7 +101,9 @@ class ForensicRepository:
         item["used_grams"] = self.location_usage(location_id)
         item["available_grams"] = round(float(item["capacity_units"]) - item["used_grams"], 6)
         item["placements"] = records(self.connection.execute(
-            "SELECT p.*,l.specimen_no FROM specimen_placements p JOIN specimens l ON l.id=p.specimen_id "
+            "SELECT p.*,l.specimen_no,"
+            "(p.quantity - (SELECT COALESCE(SUM(i.quantity),0) FROM custody_event_items i WHERE i.placement_id=p.id)) AS remaining_quantity "
+            "FROM specimen_placements p JOIN specimens l ON l.id=p.specimen_id "
             "WHERE p.location_id=? AND p.removed_at IS NULL ORDER BY p.container_code", (location_id,)
         ).fetchall())
         return item
@@ -119,12 +123,18 @@ class ForensicRepository:
         item = self.require_specimen(specimen_id)
         item["forensic_case"] = self.require_forensic_case(int(item["case_id"]))
         item["placements"] = records(self.connection.execute(
-            "SELECT p.*,s.location_code FROM specimen_placements p JOIN storage_locations s ON s.id=p.location_id "
+            "SELECT p.*,s.location_code,"
+            "(SELECT COALESCE(SUM(i.quantity),0) FROM custody_event_items i WHERE i.placement_id=p.id) AS consumed_quantity,"
+            "(p.quantity - (SELECT COALESCE(SUM(i.quantity),0) FROM custody_event_items i WHERE i.placement_id=p.id)) AS remaining_quantity "
+            "FROM specimen_placements p JOIN storage_locations s ON s.id=p.location_id "
             "WHERE p.specimen_id=? ORDER BY p.id", (specimen_id,)
         ).fetchall())
-        item["movements"] = records(self.connection.execute(
+        movements = records(self.connection.execute(
             "SELECT * FROM custody_events WHERE specimen_id=? ORDER BY id", (specimen_id,)
         ).fetchall())
+        for movement in movements:
+            movement["items"] = self.custody_event_items(int(movement["id"]))
+        item["movements"] = movements
         item["holds"] = records(self.connection.execute(
             "SELECT * FROM specimen_holds WHERE specimen_id=? ORDER BY id", (specimen_id,)
         ).fetchall())
@@ -142,6 +152,26 @@ class ForensicRepository:
 
     def custody_event_by_key(self, key: str) -> dict[str, Any] | None:
         return record(self.connection.execute("SELECT * FROM custody_events WHERE idempotency_key=?", (key,)).fetchone())
+
+    def custody_event_items(self, event_id: int) -> list[dict[str, Any]]:
+        return records(self.connection.execute(
+            "SELECT * FROM custody_event_items WHERE custody_event_id=? ORDER BY id", (event_id,)
+        ).fetchall())
+
+    def placement_consumed(self, placement_id: int) -> float:
+        return float(self.connection.execute(
+            "SELECT COALESCE(SUM(quantity),0) FROM custody_event_items WHERE placement_id=?", (placement_id,)
+        ).fetchone()[0])
+
+    def placement_remaining(self, placement_id: int) -> float:
+        row = self.connection.execute(
+            "SELECT p.quantity,COALESCE((SELECT SUM(i.quantity) FROM custody_event_items i WHERE i.placement_id=p.id),0) "
+            "FROM specimen_placements p WHERE p.id=?",
+            (placement_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("容器摆放记录不存在")
+        return round(float(row[0]) - float(row[1]), 6)
 
     def require_protocol(self, protocol_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM examination_protocols WHERE id=?", (protocol_id,)).fetchone())
